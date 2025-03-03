@@ -303,6 +303,48 @@ func SaveAbsen(c *fiber.Ctx) error {
 	})
 }
 
+func SaveAbsenQR(c *fiber.Ctx) error {
+	body := struct {
+		MesinID string `json:"mesin_id"`
+		QRCode  string `json:"qr_code"`
+	}{}
+
+	if err := c.BodyParser(&body); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
+	}
+
+	if body.MesinID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "mesin_id is required"})
+	}
+
+	if body.QRCode == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "No QR code data provided"})
+	}
+
+	// Optimasi: Gunakan index di kolom qr_code untuk mempercepat pencarian
+	var userID int
+	var fullname string
+	err := db.QueryRow("SELECT id, fullname FROM peserta WHERE qr_code = ?", body.QRCode).Scan(&userID, &fullname)
+	if err != nil {
+		log.Println("QR Code not found in database:", err)
+		return c.Status(404).JSON(fiber.Map{"error": "No matching QR code found"})
+	}
+
+	_, err = db.Exec("INSERT INTO absensi (user_id, finger_id, jam, mesin_id) VALUES (?, ?, ?, ?)",
+		userID, body.QRCode, time.Now().UTC(), body.MesinID)
+	if err != nil {
+		log.Println("Error inserting attendance record:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save attendance record"})
+	}
+
+	return c.JSON(fiber.Map{
+		"message":  "QR Code found and attendance recorded",
+		"qr_code":  body.QRCode,
+		"user_id":  userID,
+		"fullname": fullname,
+	})
+}
+
 func ApiKeyMiddleware(c *fiber.Ctx) error {
 	apiKey := c.Get("X-API-Key")          // Ambil API Key dari header
 	validApiKey := "shollusemakindidepan" // Ganti dengan API Key yang aman
@@ -331,6 +373,7 @@ func main() {
 	api := app.Group("/api/v1")
 	api.Post("/enroll", ApiKeyMiddleware, EnrollFingerprintNew)
 	api.Post("/absent", ApiKeyMiddleware, SaveAbsen)
+	api.Post("/absent-qr", ApiKeyMiddleware, SaveAbsenQR)
 	api.Post("/enroll-mode", ApiKeyMiddleware, EnrollMode)
 
 	log.Println("Server running on :3000")
