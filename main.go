@@ -70,6 +70,27 @@ func ConvertToVector(fingerprint []byte) []float32 {
 	return vector
 }
 
+func ConvertToVectorV2(fingerprint []byte) []byte {
+	if len(fingerprint) < 512 {
+		panic("Fingerprint data too short")
+	}
+
+	// Konversi fingerprint []byte ke vektor float32 (512 dimensi)
+	vector := make([]float32, 512)
+	for i := 0; i < 512; i++ {
+		vector[i] = float32(fingerprint[i]) / 255.0 // Normalisasi ke [0,1]
+	}
+
+	// Encode vektor float32 ke []byte agar bisa disimpan di Redis
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.LittleEndian, vector)
+	if err != nil {
+		log.Println("Error encoding fingerprint vector:", err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
 func VectorToString(vector []float32) string {
 	var buf bytes.Buffer
 	for _, val := range vector {
@@ -106,7 +127,7 @@ func EnrollFingerprint(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Fingerprint enrolled", "id": fingerprintID})
 }
 
-const THRESHOLD = 0.0008 // Bisa disesuaikan berdasarkan uji coba
+const THRESHOLD = 0.1 // Bisa disesuaikan berdasarkan uji coba
 
 func SearchFingerprint(c *fiber.Ctx) error {
 	fingerprintData := c.Body()
@@ -230,6 +251,36 @@ func EnrollFingerprintNew(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Fingerprint enrolled", "id": fingerprintID})
 }
 
+func EnrollFingerprintNewV2(c *fiber.Ctx) error {
+	userID := c.Query("user_id")
+	if userID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id is required"})
+	}
+
+	fingerprintData := c.Body()
+	if len(fingerprintData) == 0 {
+		return c.Status(400).JSON(fiber.Map{"error": "No fingerprint data provided"})
+	}
+
+	vector := ConvertToVectorV2(fingerprintData)
+	// vectorString := VectorToString(vector)
+	fingerprintID := fmt.Sprintf("fingerprint:%x", md5.Sum(fingerprintData))
+
+	err := rdb.HSet(ctx, fingerprintID, "vector", vector).Err()
+	if err != nil {
+		log.Println("Error saving fingerprint to Redis:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save fingerprint"})
+	}
+
+	_, err = db.Exec("INSERT INTO userFinger (user_id, finger_id, created_at) VALUES (?, ?, ?)", userID, fingerprintID, time.Now().UTC())
+	if err != nil {
+		log.Println("Error inserting fingerprint into MySQL:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save fingerprint in database"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Fingerprint enrolled", "id": fingerprintID})
+}
+
 func SaveAbsen(c *fiber.Ctx) error {
 	mesinID := c.Query("mesin_id")
 	if mesinID == "" {
@@ -273,6 +324,114 @@ func SaveAbsen(c *fiber.Ctx) error {
 	}
 
 	fingerprintID, _ := bestMatch["id"].(string)
+
+	extraAttrs, ok := bestMatch["extra_attributes"].(map[interface{}]interface{})
+	if !ok {
+		return c.Status(500).JSON(fiber.Map{"error": "Invalid attributes format"})
+	}
+
+	scoreStr, _ := extraAttrs["score"].(string)
+	score, err := strconv.ParseFloat(scoreStr, 64)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Invalid score format"})
+	}
+
+	// Cek apakah skor di bawah threshold
+	if score > THRESHOLD {
+		return c.Status(404).JSON(fiber.Map{"error": "No fingerprint match found"})
+	}
+
+	var userID int
+	err = db.QueryRow("SELECT user_id FROM userFinger WHERE finger_id = ?", fingerprintID).Scan(&userID)
+	if err != nil {
+		log.Println("Fingerprint not found in database:", err)
+		return c.Status(404).JSON(fiber.Map{"error": "No fingerprint match found"})
+	}
+
+	// 🔍 Ambil `fullname` dari tabel `peserta`
+	var fullname string
+	err = db.QueryRow("SELECT fullname FROM peserta WHERE id = ?", userID).Scan(&fullname)
+	if err != nil {
+		log.Println("Error retrieving fullname:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to retrieve fullname"})
+	}
+
+	_, err = db.Exec("INSERT INTO absensi (user_id, finger_id, jam, mesin_id) VALUES (?, ?, ?, ?)",
+		userID, fingerprintID, time.Now().UTC(), mesinID)
+	if err != nil {
+		log.Println("Error inserting attendance record:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to save attendance record"})
+	}
+
+	return c.JSON(fiber.Map{
+		"message":        "Fingerprint found and attendance recorded",
+		"fingerprint_id": fingerprintID,
+		"user_id":        userID,
+		"fullname":       fullname,
+	})
+}
+
+// Save yang lebih akurat
+func SaveAbsenV2(c *fiber.Ctx) error {
+	mesinID := c.Query("mesin_id")
+	if mesinID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "mesin_id is required"})
+	}
+	fingerprintData := c.Body()
+	if len(fingerprintData) == 0 {
+		return c.Status(400).JSON(fiber.Map{"error": "No fingerprint data provided"})
+	}
+
+	scannedVector := ConvertToVectorV2(fingerprintData)
+	// queryVector := VectorToString(scannedVector)
+
+	rawResult, err := rdb.Do(ctx, "FT.SEARCH", "fingerprint_index_v2",
+		"*=>[KNN 1 @vector $query_vector AS score]",
+		"PARAMS", "2", "query_vector", scannedVector,
+		"SORTBY", "score", "ASC",
+		"LIMIT", "0", "1",
+		"DIALECT", "2").Result()
+
+	if err != nil {
+		log.Println("Error searching fingerprint:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to search fingerprint"})
+	}
+
+	resultMap, ok := rawResult.(map[interface{}]interface{})
+	if !ok {
+		log.Println("Error: Unexpected search result format")
+		return c.Status(500).JSON(fiber.Map{"error": "Invalid search result format"})
+	}
+
+	results, ok := resultMap["results"].([]interface{})
+	if !ok || len(results) == 0 {
+		return c.Status(404).JSON(fiber.Map{"error": "No fingerprint found"})
+	}
+
+	// Ambil fingerprint dengan skor terbaik
+	bestMatch, ok := results[0].(map[interface{}]interface{})
+	if !ok {
+		return c.Status(500).JSON(fiber.Map{"error": "Invalid result structure"})
+	}
+
+	fingerprintID, _ := bestMatch["id"].(string)
+
+	extraAttrs, ok := bestMatch["extra_attributes"].(map[interface{}]interface{})
+	if !ok {
+		return c.Status(500).JSON(fiber.Map{"error": "Invalid attributes format"})
+	}
+
+	scoreStr, _ := extraAttrs["score"].(string)
+	score, err := strconv.ParseFloat(scoreStr, 64)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Invalid score format"})
+	}
+
+	// Cek apakah skor di bawah threshold
+	if score > THRESHOLD {
+		return c.Status(404).JSON(fiber.Map{"error": "No fingerprint match found"})
+	}
+
 	var userID int
 	err = db.QueryRow("SELECT user_id FROM userFinger WHERE finger_id = ?", fingerprintID).Scan(&userID)
 	if err != nil {
@@ -360,11 +519,17 @@ func main() {
 	initMQTT()
 	initDB()
 
-	_ = rdb.Do(ctx, "FT.CREATE", "fingerprint_index",
+	// _ = rdb.Do(ctx, "FT.CREATE", "fingerprint_index",
+	// 	"ON", "HASH",
+	// 	"PREFIX", "1", "fingerprint:",
+	// 	"SCHEMA", "vector", "VECTOR", "HNSW", "6",
+	// 	"TYPE", "FLOAT32", "DIM", "16", "DISTANCE_METRIC", "L2").Err()
+
+	_ = rdb.Do(ctx, "FT.CREATE", "fingerprint_index_v2",
 		"ON", "HASH",
 		"PREFIX", "1", "fingerprint:",
 		"SCHEMA", "vector", "VECTOR", "HNSW", "6",
-		"TYPE", "FLOAT32", "DIM", "16", "DISTANCE_METRIC", "L2").Err()
+		"TYPE", "FLOAT32", "DIM", "512", "DISTANCE_METRIC", "L2").Err()
 
 	app.Post("/enroll", EnrollFingerprint)
 	app.Post("/search", SearchFingerprint)
@@ -375,6 +540,10 @@ func main() {
 	api.Post("/absent", ApiKeyMiddleware, SaveAbsen)
 	api.Post("/absent-qr", ApiKeyMiddleware, SaveAbsenQR)
 	api.Post("/enroll-mode", ApiKeyMiddleware, EnrollMode)
+
+	apiV2 := app.Group("/api/v2")
+	apiV2.Post("/enroll", ApiKeyMiddleware, EnrollFingerprintNewV2)
+	apiV2.Post("/absent", ApiKeyMiddleware, SaveAbsenV2)
 
 	log.Println("Server running on :3000")
 	log.Fatal(app.Listen(":3000"))
