@@ -127,7 +127,7 @@ func EnrollFingerprint(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Fingerprint enrolled", "id": fingerprintID})
 }
 
-const THRESHOLD = 0.1 // Bisa disesuaikan berdasarkan uji coba
+const THRESHOLD = 0.40 // Bisa disesuaikan berdasarkan uji coba
 
 func SearchFingerprint(c *fiber.Ctx) error {
 	fingerprintData := c.Body()
