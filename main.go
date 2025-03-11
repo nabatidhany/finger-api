@@ -37,7 +37,8 @@ var mqttClient MQTT.Client
 
 func initDB() {
 	var err error
-	dsn := "sholudbuser:sholluuserdb@tcp(3.86.151.127:3306)/db_shollu"
+	dsn := "u483254679_shollu:Shollu2025@tcp(185.232.14.52:3306)/u483254679_shollu"
+	// dsn := "sholudbuser:sholluuserdb@tcp(3.86.151.127:3306)/db_shollu"
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
@@ -381,6 +382,7 @@ func SaveAbsenV2(c *fiber.Ctx) error {
 	if len(fingerprintData) == 0 {
 		return c.Status(400).JSON(fiber.Map{"error": "No fingerprint data provided"})
 	}
+	fmt.Println("Fingerprint data:", fingerprintData)
 
 	scannedVector := ConvertToVectorV2(fingerprintData)
 	// queryVector := VectorToString(scannedVector)
@@ -396,6 +398,8 @@ func SaveAbsenV2(c *fiber.Ctx) error {
 		log.Println("Error searching fingerprint:", err)
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to search fingerprint"})
 	}
+
+	log.Printf("Raw search result: %#v\n", rawResult)
 
 	resultMap, ok := rawResult.(map[interface{}]interface{})
 	if !ok {
@@ -466,6 +470,7 @@ func SaveAbsenQR(c *fiber.Ctx) error {
 	body := struct {
 		MesinID string `json:"mesin_id"`
 		QRCode  string `json:"qr_code"`
+		EventID string `json:"event_id"`
 	}{}
 
 	if err := c.BodyParser(&body); err != nil {
@@ -489,8 +494,8 @@ func SaveAbsenQR(c *fiber.Ctx) error {
 		return c.Status(404).JSON(fiber.Map{"error": "No matching QR code found"})
 	}
 
-	_, err = db.Exec("INSERT INTO absensi (user_id, finger_id, jam, mesin_id) VALUES (?, ?, ?, ?)",
-		userID, body.QRCode, time.Now().UTC(), body.MesinID)
+	_, err = db.Exec("INSERT INTO absensi (user_id, finger_id, jam, mesin_id, event_id) VALUES (?, ?, ?, ?, ?)",
+		userID, body.QRCode, time.Now().UTC(), body.MesinID, body.EventID)
 	if err != nil {
 		log.Println("Error inserting attendance record:", err)
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to save attendance record"})
@@ -501,6 +506,7 @@ func SaveAbsenQR(c *fiber.Ctx) error {
 		"qr_code":  body.QRCode,
 		"user_id":  userID,
 		"fullname": fullname,
+		"event_id": body.EventID,
 	})
 }
 
